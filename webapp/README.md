@@ -13,20 +13,29 @@ locally via [transformers.js](https://github.com/huggingface/transformers.js) on
 
 ## How it works
 
-SAM is split into two very unequal halves:
+SAM is split into two very unequal halves, and we exploit that to make picking
+feel instant:
 
 1. **Encoder (runs once per image).** A distilled ViT
    ([`Xenova/slimsam-77-uniform`](https://huggingface.co/Xenova/slimsam-77-uniform),
-   ~40 MB) turns the image into an embedding. This is the only "slow" step
-   (a second or two on a GPU) and happens a single time per image.
-2. **Decoder (runs on every cursor move).** Given the cached embedding and the
-   cursor position as a *point prompt*, it returns three nested masks in a few
-   milliseconds. We rank them by area so you can scrub from the whole object down
-   to its smallest part.
+   ~40 MB) turns the image into an embedding. This is the only "slow" step.
+2. **Pre-mapping (runs once per image).** Instead of decoding on every cursor
+   move, the worker sweeps a grid of point prompts through the cached embedding
+   to discover **every object up front**. It skips points already inside a found
+   object (coverage) and drops near-duplicates, then crops each mask to its
+   bounding box and **streams it to the UI** as it's found — so you can start
+   picking before the sweep finishes.
+3. **Picking (instant).** Hovering is now a pure hit-test against the pre-mapped
+   masks — no model calls. Objects under the cursor are stacked largest→smallest
+   for the size scrub.
 
-The encoder/decoder both live in a **Web Worker** (`assets/js/sam-worker.js`) so
-the UI thread stays responsive. The main thread (`assets/js/sam-app.js`) handles
-the canvas, the hover-to-pick loop, freezing, removal, undo and export.
+Inference lives in a **Web Worker** (`assets/js/sam-worker.js`) so the UI thread
+stays responsive. The main thread (`assets/js/sam-app.js`) handles the canvas,
+the hit-test hover loop, freezing, removal, undo and export.
+
+> Pre-mapping is heavier up front than per-hover decoding, but it happens once
+> and is dramatically faster to *use*. Grid density adapts to the backend
+> (denser on WebGPU, lighter on CPU); see `GRID` in `sam-app.js`.
 
 ## Controls
 

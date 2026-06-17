@@ -1,7 +1,10 @@
 /* ============================================================
    SAM Section — main thread UI / interaction controller
-   Talks to sam-worker.js (the on-device SAM engine) and drives
-   the canvas, the hover-to-pick loop, freeze and removal.
+
+   The worker pre-maps every object once (grid sweep over the
+   cached embedding) and streams compact masks here. Hovering is
+   then a pure hit-test against those masks — instant, no model
+   calls per cursor move.
    ============================================================ */
 
 const MAX_SIDE = 1024; // SAM operates on a 1024px long side.
@@ -11,6 +14,10 @@ const SAMPLES = [
   { name: "Truck", src: "assets/img/samples/truck.jpg" },
   { name: "Groceries", src: "assets/img/samples/groceries.jpg" },
 ];
+
+// Grid density for pre-mapping (a denser grid finds more/smaller objects).
+const GRID = { webgpu: 24, wasm: 14 };
+const MAX_OBJECTS = 220;
 
 /* ---- DOM --------------------------------------------------- */
 const $ = (id) => document.getElementById(id);
@@ -32,7 +39,6 @@ const toastEl = $("toast");
 const imageCtx = imageCanvas.getContext("2d", { willReadFrequently: true });
 const overlayCtx = overlayCanvas.getContext("2d");
 
-/* ---- Colors for the mask overlay --------------------------- */
 const PICK = { fill: [124, 92, 255, 84], edge: [186, 160, 255, 255] };
 const FROZEN = { fill: [255, 92, 200, 86], edge: [255, 178, 224, 255] };
 
@@ -41,18 +47,17 @@ const state = {
   ready: false,
   device: "—",
   hasImage: false,
-  encoded: false,
-  pendingEncode: false,
-  encodeId: 0,
+  mapping: false,
+  pendingGenerate: false,
+  jobId: 0,
   W: 0, H: 0,
   originalImageData: null,
-  overlayImage: null,         // reusable ImageData for the overlay
-  candidates: null,           // { masks, order, areas, scores }
-  index: 0,                   // index into candidates.order (0 = biggest)
+  overlayImage: null,
+  objects: [],            // all pre-mapped objects: {id,bbox,w,h,area,score,bits}
+  candidates: null,       // objects under the cursor, sorted largest→smallest
+  index: 0,               // scrub index into candidates
   frozen: false,
-  frozenMask: null,
-  pendingPoint: null,
-  inFlight: false,
+  frozenObj: null,
   undo: [],
 };
 const MAX_UNDO = 15;
@@ -61,9 +66,7 @@ const MAX_UNDO = 15;
 const params = new URLSearchParams(location.search);
 const worker = new Worker("assets/js/sam-worker.js", { type: "module" });
 worker.addEventListener("message", onWorkerMessage);
-worker.addEventListener("error", (e) =>
-  setStatus("error", "Worker failed to start")
-);
+worker.addEventListener("error", () => setStatus("error", "Worker failed to start"));
 worker.postMessage({ type: "load", backend: params.get("backend") || undefined });
 
 /* ---- Small helpers ----------------------------------------- */
@@ -89,13 +92,13 @@ function showLoader(title, msg, pct) {
 }
 function hideLoader() { loader.classList.remove("show"); }
 
-/* ---- Worker message handling ------------------------------- */
+/* ---- Worker messages --------------------------------------- */
 function onWorkerMessage(e) {
   const m = e.data;
   switch (m.type) {
     case "progress":
-      showLoader("Preparing SAM", m.text, m.pct);
-      setStatus("loading", "Loading model…");
+      if (state.mapping) setStatus("loading", m.text);
+      else { showLoader("Preparing SAM", m.text, m.pct); setStatus("loading", "Loading model…"); }
       break;
     case "ready":
       state.ready = true;
@@ -103,34 +106,40 @@ function onWorkerMessage(e) {
       deviceText.textContent = m.device === "webgpu" ? "WebGPU" : "WASM · CPU";
       devicePill.title = m.device === "webgpu"
         ? "Running on your GPU via WebGPU"
-        : "WebGPU unavailable — running on CPU (slower)";
+        : "WebGPU unavailable — running on CPU (slower mapping)";
       setStatus("ready", "Ready");
-      if (state.pendingEncode) doEncode();
+      if (state.pendingGenerate) doGenerate();
       else hideLoader();
       break;
     case "encoded":
-      if (m.id !== state.encodeId) return; // stale
-      state.encoded = true;
+      if (m.id !== state.jobId) return;
+      showLoader("Mapping objects", "Finding every object — this runs once per image…", 0);
+      break;
+    case "mapping_start":
+      if (m.id !== state.jobId) return;
+      state.mapping = true;
       hideLoader();
-      setStatus("ready", "Pick anything");
       hud.classList.add("show");
       dock.classList.add("show");
       canvasWrap.classList.remove("cursor-busy");
       canvasWrap.classList.add("cursor-pick");
+      setStatus("loading", "Mapping objects · 0%");
+      updateHUD();
       break;
-    case "masks":
-      onMasks(m);
+    case "object":
+      if (m.id !== state.jobId) return;
+      state.objects.push(m.obj);
+      break;
+    case "objects_done":
+      if (m.id !== state.jobId) return;
+      state.mapping = false;
+      setStatus("ready", `Pick anything · ${m.count} objects`);
+      refreshButtons();
       break;
     case "error":
       console.error("[SAM]", m.message);
-      if (m.fatal) {
-        setStatus("error", "Model failed to load");
-        showLoader("Couldn't start SAM", m.message + " — try reloading.", null);
-      } else {
-        toast("Inference error: " + m.message, true);
-        state.inFlight = false;
-        canvasWrap.classList.remove("cursor-busy");
-      }
+      if (m.fatal) { setStatus("error", "Model failed to load"); showLoader("Couldn't start SAM", m.message + " — try reloading.", null); }
+      else { toast("Error: " + m.message, true); state.mapping = false; setStatus("error", "Mapping failed"); }
       break;
   }
 }
@@ -143,31 +152,22 @@ fileInput.addEventListener("change", (e) => {
   if (f) loadFromFile(f);
   fileInput.value = "";
 });
-pasteHint.addEventListener("click", () =>
-  toast("Press ⌘/Ctrl + V to paste an image")
-);
+pasteHint.addEventListener("click", () => toast("Press ⌘/Ctrl + V to paste an image"));
 
-// Drag & drop
 ["dragenter", "dragover"].forEach((ev) =>
-  dropzone.addEventListener(ev, (e) => { e.preventDefault(); dropzone.classList.add("drag"); })
-);
+  dropzone.addEventListener(ev, (e) => { e.preventDefault(); dropzone.classList.add("drag"); }));
 ["dragleave", "drop"].forEach((ev) =>
-  dropzone.addEventListener(ev, (e) => { e.preventDefault(); dropzone.classList.remove("drag"); })
-);
+  dropzone.addEventListener(ev, (e) => { e.preventDefault(); dropzone.classList.remove("drag"); }));
 dropzone.addEventListener("drop", (e) => {
   const f = e.dataTransfer.files && e.dataTransfer.files[0];
   if (f && f.type.startsWith("image/")) loadFromFile(f);
 });
-// Paste
 window.addEventListener("paste", (e) => {
   const items = e.clipboardData && e.clipboardData.items;
   if (!items) return;
-  for (const it of items) {
-    if (it.type.startsWith("image/")) { loadFromFile(it.getAsFile()); break; }
-  }
+  for (const it of items) if (it.type.startsWith("image/")) { loadFromFile(it.getAsFile()); break; }
 });
 
-// Samples
 SAMPLES.forEach((s) => {
   const b = document.createElement("button");
   b.className = "sample";
@@ -192,9 +192,8 @@ function loadFromURL(src) {
   img.src = src;
 }
 
-/* ---- Prepare an image for segmentation --------------------- */
+/* ---- Prepare an image -------------------------------------- */
 function onImageReady(img) {
-  // Downscale so the long side is <= MAX_SIDE (SAM's working resolution).
   const scale = Math.min(1, MAX_SIDE / Math.max(img.naturalWidth, img.naturalHeight));
   const W = Math.max(1, Math.round(img.naturalWidth * scale));
   const H = Math.max(1, Math.round(img.naturalHeight * scale));
@@ -208,15 +207,14 @@ function onImageReady(img) {
   state.originalImageData = imageCtx.getImageData(0, 0, W, H);
   state.overlayImage = overlayCtx.createImageData(W, H);
 
-  // Reset interaction state
+  // reset interaction
   state.hasImage = true;
-  state.encoded = false;
+  state.mapping = false;
+  state.objects = [];
   state.candidates = null;
   state.index = 0;
   state.frozen = false;
-  state.frozenMask = null;
-  state.pendingPoint = null;
-  state.inFlight = false;
+  state.frozenObj = null;
   state.undo = [];
   clearOverlay();
   refreshButtons();
@@ -226,21 +224,22 @@ function onImageReady(img) {
   newImageBtn.hidden = false;
   fitImage();
 
-  if (state.ready) doEncode();
-  else { state.pendingEncode = true; showLoader("Preparing SAM", "Waiting for the model to finish loading…", null); }
+  if (state.ready) doGenerate();
+  else { state.pendingGenerate = true; showLoader("Preparing SAM", "Waiting for the model to finish loading…", null); }
 }
 
-function doEncode() {
-  state.pendingEncode = false;
-  state.encodeId++;
-  const id = state.encodeId;
+function doGenerate() {
+  state.pendingGenerate = false;
+  state.jobId++;
+  const id = state.jobId;
   showLoader("Reading the image", "Encoding on " + (state.device === "webgpu" ? "your GPU" : "CPU") + "…", null);
   setStatus("loading", "Encoding…");
   canvasWrap.classList.add("cursor-busy");
 
+  const pointsPerSide = GRID[state.device] || GRID.wasm;
   const snapshot = imageCtx.getImageData(0, 0, state.W, state.H);
   worker.postMessage(
-    { type: "encode", id, width: state.W, height: state.H, data: snapshot.data.buffer },
+    { type: "generate", id, width: state.W, height: state.H, data: snapshot.data.buffer, pointsPerSide, maxObjects: MAX_OBJECTS },
     [snapshot.data.buffer]
   );
 }
@@ -250,7 +249,7 @@ function fitImage() {
   if (!state.hasImage) return;
   const pad = 48;
   const availW = stage.clientWidth - pad;
-  const availH = stage.clientHeight - 150; // leave room for dock + HUD
+  const availH = stage.clientHeight - 150;
   const ar = state.W / state.H;
   let w = Math.min(availW, 1100);
   let h = w / ar;
@@ -259,82 +258,63 @@ function fitImage() {
   canvasWrap.style.height = Math.round(h) + "px";
 }
 let resizeRAF;
-window.addEventListener("resize", () => {
-  cancelAnimationFrame(resizeRAF);
-  resizeRAF = requestAnimationFrame(fitImage);
-});
+window.addEventListener("resize", () => { cancelAnimationFrame(resizeRAF); resizeRAF = requestAnimationFrame(fitImage); });
 
-/* ---- Hover → decode loop ----------------------------------- */
+/* ---- Hit-testing (instant hover) --------------------------- */
+function hitTest(px, py) {
+  const out = [];
+  for (const o of state.objects) {
+    const [x0, y0, x1, y1] = o.bbox;
+    if (px < x0 || px >= x1 || py < y0 || py >= y1) continue;
+    if (o.bits[(py - y0) * o.w + (px - x0)]) out.push(o);
+  }
+  out.sort((a, b) => b.area - a.area); // largest → smallest
+  return out;
+}
+
 canvasWrap.addEventListener("mousemove", (e) => {
-  if (!state.encoded || state.frozen) return;
+  if (state.frozen || !state.objects.length) return;
   const r = imageCanvas.getBoundingClientRect();
-  const x = (e.clientX - r.left) / r.width;
-  const y = (e.clientY - r.top) / r.height;
-  if (x < 0 || x > 1 || y < 0 || y > 1) return;
-  state.pendingPoint = { x: clamp01(x), y: clamp01(y) };
-  pump();
+  const px = Math.floor(((e.clientX - r.left) / r.width) * state.W);
+  const py = Math.floor(((e.clientY - r.top) / r.height) * state.H);
+  if (px < 0 || py < 0 || px >= state.W || py >= state.H) { clearHover(); return; }
+  const list = hitTest(px, py);
+  if (!list.length) { clearHover(); return; }
+  state.candidates = list;
+  state.index = Math.min(state.index, list.length - 1);
+  renderObject(list[state.index], PICK);
+  refreshButtons();
+  updateHUD();
 });
-canvasWrap.addEventListener("mouseleave", () => {
-  state.pendingPoint = null;
-  if (!state.frozen) { state.candidates = null; clearOverlay(); refreshButtons(); updateHUD(); }
-});
+canvasWrap.addEventListener("mouseleave", () => { if (!state.frozen) clearHover(); });
 
-function pump() {
-  if (state.inFlight || state.frozen || !state.pendingPoint) return;
-  const p = state.pendingPoint;
-  state.pendingPoint = null;
-  state.inFlight = true;
-  worker.postMessage({ type: "decode", x: p.x, y: p.y });
-}
-
-function onMasks(m) {
-  state.inFlight = false;
-  if (!state.encoded) return;
-  state.candidates = { masks: m.masks, order: m.order, areas: m.areas, scores: m.scores, dims: m.dims };
-  // Keep the user's chosen granularity across hovers, clamped to range.
-  state.index = Math.min(state.index, m.order.length - 1);
-  if (!state.frozen) { renderCurrent(); refreshButtons(); updateHUD(); }
-  // Coalesce: if the cursor moved while we were busy, go again.
-  if (state.pendingPoint && !state.frozen) requestAnimationFrame(pump);
-}
-
-/* ---- Current mask helpers ---------------------------------- */
-function currentMask() {
-  const c = state.candidates;
-  if (!c) return null;
-  const idx = c.order[state.index];
-  return c.masks[idx];
-}
-function currentScore() {
-  const c = state.candidates;
-  if (!c) return 0;
-  return c.scores[c.order[state.index]] ?? 0;
+function clearHover() {
+  state.candidates = null;
+  clearOverlay();
+  refreshButtons();
+  updateHUD();
 }
 
 /* ---- Overlay rendering ------------------------------------- */
-function clearOverlay() {
-  overlayCtx.clearRect(0, 0, overlayCanvas.width, overlayCanvas.height);
-}
-function renderCurrent() {
-  const mask = state.frozen ? state.frozenMask : currentMask();
-  if (!mask) { clearOverlay(); return; }
-  renderMask(mask, state.frozen ? FROZEN : PICK);
-}
-function renderMask(mask, color) {
-  const W = state.W, H = state.H;
+function clearOverlay() { overlayCtx.clearRect(0, 0, overlayCanvas.width, overlayCanvas.height); }
+
+function renderObject(obj, color) {
+  const W = state.W;
   const img = state.overlayImage;
   const data = img.data;
   data.fill(0);
+  const [x0, y0] = obj.bbox;
+  const bw = obj.w, bh = obj.h, bits = obj.bits;
   const [fr, fg, fb, fa] = color.fill;
   const [er, eg, eb, ea] = color.edge;
-  for (let y = 0; y < H; y++) {
-    for (let x = 0; x < W; x++) {
-      const p = y * W + x;
-      if (!mask[p]) continue;
+  for (let yy = 0; yy < bh; yy++) {
+    for (let xx = 0; xx < bw; xx++) {
+      if (!bits[yy * bw + xx]) continue;
       const edge =
-        x === 0 || y === 0 || x === W - 1 || y === H - 1 ||
-        !mask[p - 1] || !mask[p + 1] || !mask[p - W] || !mask[p + W];
-      const o = p << 2;
+        xx === 0 || yy === 0 || xx === bw - 1 || yy === bh - 1 ||
+        !bits[yy * bw + xx - 1] || !bits[yy * bw + xx + 1] ||
+        !bits[(yy - 1) * bw + xx] || !bits[(yy + 1) * bw + xx];
+      const o = ((y0 + yy) * W + (x0 + xx)) << 2;
       if (edge) { data[o] = er; data[o + 1] = eg; data[o + 2] = eb; data[o + 3] = ea; }
       else { data[o] = fr; data[o + 1] = fg; data[o + 2] = fb; data[o + 3] = fa; }
     }
@@ -343,44 +323,50 @@ function renderMask(mask, color) {
 }
 
 /* ---- HUD --------------------------------------------------- */
+function selectedObj() {
+  if (state.frozen) return state.frozenObj;
+  return state.candidates ? state.candidates[state.index] : null;
+}
 function updateHUD() {
-  const c = state.candidates;
-  const n = c ? c.order.length : 0;
+  const n = state.candidates ? state.candidates.length : 0;
   const k = n ? state.index + 1 : 0;
   let tag = "";
   if (n) tag = state.index === 0 ? " · largest" : state.index === n - 1 ? " · smallest" : "";
   scaleLabel.textContent = n ? `Size ${k}/${n}` : "Size —";
   hudScale.textContent = n ? `${k}/${n}${tag}` : "—";
 
-  const score = currentScore();
-  hudScore.textContent = n ? score.toFixed(2) : "—";
-  hudMeter.style.width = n ? Math.round(score * 100) + "%" : "0%";
+  const obj = selectedObj();
+  const score = obj ? obj.score : 0;
+  hudScore.textContent = obj ? score.toFixed(2) : "—";
+  hudMeter.style.width = obj ? Math.round(score * 100) + "%" : "0%";
 
   const sw = hud.querySelector(".swatch");
   if (sw) sw.style.background = state.frozen ? "var(--magenta)" : "var(--accent)";
   hudPick.textContent = state.frozen
     ? "Frozen — press Delete to remove"
-    : n ? "Click or press F to freeze" : "Move the cursor to pick";
+    : n ? "Click or press F to freeze"
+    : state.mapping ? "Mapping… hover to pick what's ready"
+    : "Move the cursor to pick";
 }
 
 /* ---- Freeze / unfreeze ------------------------------------- */
 canvasWrap.addEventListener("click", () => {
-  if (!state.encoded) return;
+  if (!state.hasImage) return;
   if (state.frozen) unfreeze();
   else if (state.candidates) freeze();
 });
 function freeze() {
-  const mask = currentMask();
-  if (!mask) return;
+  const obj = state.candidates && state.candidates[state.index];
+  if (!obj) return;
   state.frozen = true;
-  state.frozenMask = mask.slice(); // own a stable copy
-  renderCurrent();
+  state.frozenObj = { ...obj, bits: obj.bits.slice() };
+  renderObject(state.frozenObj, FROZEN);
   refreshButtons();
   updateHUD();
 }
 function unfreeze() {
   state.frozen = false;
-  state.frozenMask = null;
+  state.frozenObj = null;
   clearOverlay();
   refreshButtons();
   updateHUD();
@@ -388,13 +374,13 @@ function unfreeze() {
 
 /* ---- Scale scrubbing --------------------------------------- */
 function nudgeSize(dir) {
-  // dir = -1 → bigger (toward index 0); +1 → smaller
   if (!state.candidates || state.frozen) return;
-  const n = state.candidates.order.length;
+  const n = state.candidates.length;
   const next = Math.min(n - 1, Math.max(0, state.index + dir));
   if (next === state.index) return;
   state.index = next;
-  renderCurrent();
+  renderObject(state.candidates[state.index], PICK);
+  refreshButtons();
   updateHUD();
 }
 sizeUp.addEventListener("click", () => nudgeSize(-1));
@@ -406,30 +392,26 @@ canvasWrap.addEventListener("wheel", (e) => {
 }, { passive: false });
 
 /* ---- Removal / history ------------------------------------- */
-freezeBtn.addEventListener("click", () => {
-  if (state.frozen) unfreeze();
-  else freeze();
-});
+freezeBtn.addEventListener("click", () => { if (state.frozen) unfreeze(); else freeze(); });
 removeBtn.addEventListener("click", removeSelection);
-function removeSelection() {
-  // Use the frozen mask if present, otherwise the live one.
-  const mask = state.frozen ? state.frozenMask : currentMask();
-  if (!mask) { toast("Hover an object first."); return; }
 
+function removeSelection() {
+  const obj = selectedObj();
+  if (!obj) { toast("Hover an object first."); return; }
   pushUndo();
-  const W = state.W, H = state.H;
-  const frame = imageCtx.getImageData(0, 0, W, H);
+  const W = state.W;
+  const frame = imageCtx.getImageData(0, 0, W, state.H);
   const d = frame.data;
-  for (let p = 0; p < mask.length; p++) {
-    if (mask[p]) d[(p << 2) + 3] = 0; // erase → transparent
+  const [x0, y0] = obj.bbox;
+  const bw = obj.w, bh = obj.h, bits = obj.bits;
+  for (let yy = 0; yy < bh; yy++) {
+    for (let xx = 0; xx < bw; xx++) {
+      if (bits[yy * bw + xx]) d[(((y0 + yy) * W + (x0 + xx)) << 2) + 3] = 0;
+    }
   }
   imageCtx.putImageData(frame, 0, 0);
-
   unfreeze();
-  state.candidates = null;
-  state.index = 0;
-  refreshButtons();
-  updateHUD();
+  clearHover();
   toast("Object removed");
 }
 function pushUndo() {
@@ -443,18 +425,14 @@ function undo() {
   if (!prev) return;
   imageCtx.putImageData(prev, 0, 0);
   unfreeze();
-  state.candidates = null;
-  refreshButtons();
-  updateHUD();
+  clearHover();
 }
 resetBtn.addEventListener("click", () => {
   if (!state.originalImageData) return;
   imageCtx.putImageData(state.originalImageData, 0, 0);
   state.undo = [];
   unfreeze();
-  state.candidates = null;
-  refreshButtons();
-  updateHUD();
+  clearHover();
   toast("Restored original");
 });
 downloadBtn.addEventListener("click", () => {
@@ -464,14 +442,14 @@ downloadBtn.addEventListener("click", () => {
   a.click();
 });
 
-/* ---- Button enable/disable --------------------------------- */
+/* ---- Button states ----------------------------------------- */
 function refreshButtons() {
-  const hasSel = !!(state.candidates || state.frozenMask);
-  const canScrub = !!state.candidates && !state.frozen;
+  const hasSel = !!(state.candidates && state.candidates.length) || !!state.frozenObj;
+  const canScrub = !!state.candidates && state.candidates.length > 1 && !state.frozen;
   freezeBtn.disabled = !hasSel;
   removeBtn.disabled = !hasSel;
   sizeUp.disabled = !canScrub || state.index === 0;
-  sizeDown.disabled = !canScrub || (state.candidates && state.index === state.candidates.order.length - 1);
+  sizeDown.disabled = !canScrub || (state.candidates && state.index === state.candidates.length - 1);
   undoBtn.disabled = state.undo.length === 0;
   resetBtn.disabled = state.undo.length === 0;
   downloadBtn.disabled = !state.hasImage;
@@ -486,8 +464,7 @@ window.addEventListener("keydown", (e) => {
   if (!state.hasImage) return;
   switch (k) {
     case "f": case "F":
-      if (state.encoded) { e.preventDefault(); state.frozen ? unfreeze() : freeze(); }
-      break;
+      e.preventDefault(); state.frozen ? unfreeze() : freeze(); break;
     case "Delete": case "Backspace":
       e.preventDefault(); removeSelection(); break;
     case "Escape":
@@ -501,12 +478,9 @@ window.addEventListener("keydown", (e) => {
   }
 });
 
-/* ---- Help toggle ------------------------------------------- */
+/* ---- Help -------------------------------------------------- */
 helpBtn.addEventListener("click", () => help.classList.toggle("show"));
 document.addEventListener("click", (e) => {
   if (help.classList.contains("show") && !help.contains(e.target) && e.target !== helpBtn && !helpBtn.contains(e.target))
     help.classList.remove("show");
 });
-
-/* ---- utils ------------------------------------------------- */
-function clamp01(v) { return v < 0 ? 0 : v > 1 ? 1 : v; }
