@@ -112,10 +112,14 @@ async function decode(msg) {
     imageInputs.reshaped_input_sizes
   );
 
-  const maskTensor = processed[0]; // dims [num, H, W]
-  const [num, H, W] = maskTensor.dims;
-  const flat = maskTensor.data; // 0/1 per pixel
-  const scores = Array.from(outputs.iou_scores.data); // length num
+  const maskTensor = processed[0]; // dims [num, H, W] or [1, num, H, W]
+  // Read shape from the tail so we're robust to a leading batch dimension.
+  const d = maskTensor.dims;
+  const W = d[d.length - 1];
+  const H = d[d.length - 2];
+  const num = d.length >= 3 ? d[d.length - 3] : 1;
+  const flat = maskTensor.data; // 0/1 per pixel, contiguous [num, H, W]
+  const rawScores = Array.from(outputs.iou_scores.data); // length num (per mask)
 
   const masks = [];
   const areas = [];
@@ -143,7 +147,7 @@ async function decode(msg) {
       order,
       masks,
       areas,
-      scores,
+      scores: rawScores,
     },
     masks.map((m) => m.buffer) // zero-copy transfer
   );
