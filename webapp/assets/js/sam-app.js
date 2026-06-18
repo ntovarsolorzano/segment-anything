@@ -35,6 +35,7 @@ const sizeUp = $("sizeUp"), sizeDown = $("sizeDown");
 const freezeBtn = $("freezeBtn"), removeBtn = $("removeBtn");
 const undoBtn = $("undoBtn"), resetBtn = $("resetBtn"), downloadBtn = $("downloadBtn");
 const toastEl = $("toast");
+const webgpuNotice = $("webgpuNotice"), noticeClose = $("noticeClose");
 
 const imageCtx = imageCanvas.getContext("2d", { willReadFrequently: true });
 const overlayCtx = overlayCanvas.getContext("2d");
@@ -108,6 +109,9 @@ function onWorkerMessage(e) {
         ? "Running on your GPU via WebGPU"
         : "WebGPU unavailable — running on CPU (slower mapping)";
       setStatus("ready", "Ready");
+      if (m.device !== "webgpu" && localStorage.getItem("sam-webgpu-dismissed") !== "1") {
+        webgpuNotice.hidden = false;
+      }
       if (state.pendingGenerate) doGenerate();
       else hideLoader();
       break;
@@ -476,6 +480,12 @@ window.addEventListener("keydown", (e) => {
     case "?":
       help.classList.toggle("show"); break;
   }
+});
+
+/* ---- WebGPU fallback notice -------------------------------- */
+noticeClose.addEventListener("click", () => {
+  webgpuNotice.hidden = true;
+  localStorage.setItem("sam-webgpu-dismissed", "1");
 });
 
 /* ---- Help -------------------------------------------------- */

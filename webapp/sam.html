@@ -37,6 +37,19 @@
     <!-- STAGE -->
     <section class="stage" id="stage">
 
+      <!-- Fallback notice: shown only when WebGPU is unavailable -->
+      <div class="notice" id="webgpuNotice" hidden>
+        <svg class="ni" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M13 2L3 14h7l-1 8 10-12h-7l1-8z" stroke-linejoin="round"/></svg>
+        <div class="nt">
+          <b>Running on CPU — mapping will be slow.</b>
+          <span>Your browser didn't expose WebGPU, so SAM can't use your GPU. Enable WebGPU (recent Chrome/Edge, or <code>chrome://flags</code> → "Unsafe WebGPU") for much faster object mapping. This isn't the app — it's the backend. 🙂</span>
+        </div>
+        <button class="nx" id="noticeClose" title="Dismiss" aria-label="Dismiss">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M6 6l12 12M18 6L6 18" stroke-linecap="round"/></svg>
+        </button>
+      </div>
+
+
       <!-- Empty state -->
       <div class="dropzone" id="dropzone">
         <div class="art">
